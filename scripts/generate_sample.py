@@ -7,6 +7,7 @@
     sample/input/segments/run-001.jsonl   路序 1
     sample/input/segments/run-002.jsonl   路序 2
     sample/job.demo.json                  登记请求体（每页 4 行）
+    sample/job.demo-shared.json           第二个作业，与 demo 共用同样三个段
 
 同键分布（验证同键按路序、路内行序输出）::
     key=5  路0 / 路1 / 路2 各一条
@@ -72,6 +73,18 @@ def main() -> None:
                         encoding="utf-8")
     total = sum(len(v) for v in RUNS.values())
     print(f"wrote {job_path.relative_to(ROOT)} (total {total} rows, page_size {PAGE_SIZE})")
+
+    # 第二个作业与 demo 登记完全相同的三个段（不同 job_id / page_size），
+    # 用于在 /docs 演示两个作业共用输入段时的引用计数式回收。
+    shared_req = dict(job_req)
+    shared_req["job_id"] = "demo-shared"
+    shared_req["page_size"] = 3
+    shared_path = ROOT / "sample" / "job.demo-shared.json"
+    shared_path.write_text(
+        json.dumps(shared_req, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"wrote {shared_path.relative_to(ROOT)} (shares all segments with {JOB_ID})")
 
 
 if __name__ == "__main__":

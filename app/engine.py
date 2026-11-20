@@ -8,11 +8,16 @@
 2. 页是发布单元：先写 ``page-XXXXX.jsonl.tmp``，fsync 后原子
    ``os.replace`` 成正式页文件，再写新的 ``state.json``（同样
    tmp + fsync + replace）。任何时刻崩溃，已发布页都保持原样。
-3. 回收（两阶段提交）：某路全部记录随页发布后，先提交
-   ``exhausted + 偏移`` 状态，再 unlink 段文件，最后提交
-   ``reclaimed`` 标记。任何一步崩溃，重启时 ``_open_job`` 都能
-   依据状态对账并补做回收；“未消费但段文件缺失”不可能由本服务
-   自身的崩溃产生。
+3. 回收（跨作业引用感知的两阶段提交）：同一段 JSONL 可被多个
+   作业登记。某路全部记录随页发布后，先提交本作业的
+   ``exhausted + 偏移`` 状态，再在工作目录级“登记表锁”内扫描
+   **所有** 已登记作业：只要还有任一作业登记了该段且尚未耗尽，
+   文件就必须保留；当前作业是最后一个耗尽它的作业时才 unlink
+   （哪怕它还有别的段要归并），最后提交本作业的 ``reclaimed``
+   标记。登记与回收互斥，保证登记成功的作业一定仍能读完该段。
+   任何一步崩溃，重启时 ``_open_job`` 都按各作业已发布的进度
+   重新做全局回收判定并补做；“未消费但段文件缺失”不可能由本
+   服务自身的崩溃产生。
 4. 续跑：状态只记录各路下一条待比较记录的字节偏移和已发布页数，
    进程重启后打开文件 ``seek(offset)`` 继续，未发布记录重新参与
    归并，整批不丢不重。
@@ -43,10 +48,12 @@ PAGE_SUFFIX = ".jsonl"
 TMP_SUFFIX = ".tmp"
 
 # 崩溃注入点（测试用）：
-#  after_page_tmp       页临时文件写完并 fsync、尚未 rename（正式页不存在）
-#  after_page_rename    页已原子发布、state.json 尚未更新
-#  after_state_commit   state.json 已原子提交（tmp+rename 均完成）
-#  after_reclaim_unlink 段文件已 unlink、reclaimed 标记尚未提交
+#  after_page_tmp        页临时文件写完并 fsync、尚未 rename（正式页不存在）
+#  after_page_rename     页已原子发布、state.json 尚未更新
+#  after_state_commit    state.json 已原子提交（tmp+rename 均完成）
+#  before_reclaim_scan   本作业耗尽状态已提交、全局回收扫描之前（可阻塞，
+#                        用于制造“回收与登记同时发生”的竞态窗口）
+#  after_reclaim_unlink  段文件已 unlink、reclaimed 标记尚未提交
 CrashHook = Callable[[str], None]
 
 
@@ -134,6 +141,12 @@ class MergeService:
     _global_locks: dict[tuple[str, str], threading.Lock] = {}
     _global_locks_guard = threading.Lock()
 
+    # 类级“登记表锁”表：key = 工作目录。同一工作目录内，作业登记
+    # （校验 + state 落盘）与跨作业回收判定（扫描全部 state + unlink）
+    # 互斥，保证登记成功的作业必然被回收扫描计数，段文件不会被提前删。
+    _registry_locks: dict[str, threading.Lock] = {}
+    _registry_locks_guard = threading.Lock()
+
     def __init__(self, mount_dir: Path, work_dir: Path, crash_hook: CrashHook | None = None):
         self.mount_dir = Path(mount_dir).resolve()
         self.work_dir = Path(work_dir).resolve()
@@ -186,6 +199,16 @@ class MergeService:
                 self._global_locks[key] = lock
             return lock
 
+    def _get_registry_lock(self) -> threading.Lock:
+        """工作目录级登记表锁：串行化“作业登记”与“跨作业回收判定”。"""
+        key = str(self.work_dir)
+        with self._registry_locks_guard:
+            lock = self._registry_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._registry_locks[key] = lock
+            return lock
+
     # ------------------------------------------------------------------ #
     # 登记
     # ------------------------------------------------------------------ #
@@ -206,29 +229,46 @@ class MergeService:
                     return existing
                 raise EngineError(f"作业 {req.job_id} 已存在且登记参数不一致")
 
-            # 校验段文件：存在、可读、键为整数且全局非降序
-            seg_states: list[SegmentState] = []
-            for seg in req.segments:
-                p = self._segment_path(seg.path)
-                if not p.is_file():
-                    raise EngineError(f"段文件不存在: {seg.path}")
-                self._validate_sorted_segment(p, req.key_field, seg.path)
-                seg_states.append(SegmentState(path=seg.path, order=seg.order))
+            # 登记表锁：从段校验到 state 落盘与回收判定互斥。
+            # 回收方只有在本状态提交后才能扫描到本作业，因此登记
+            # 成功的作业一定仍能读到它登记的每一个段文件。
+            with self._get_registry_lock():
+                # 双重检查：持锁后再确认一次，避免锁外判断后被并发抢先登记
+                if state_path.exists():
+                    existing = self._read_state(req.job_id)
+                    same = (
+                        existing.key_field == req.key_field
+                        and existing.page_size == req.page_size
+                        and [s.path for s in existing.segments] == [s.path for s in req.segments]
+                        and [s.order for s in existing.segments] == [s.order for s in req.segments]
+                    )
+                    if same:
+                        return existing
+                    raise EngineError(f"作业 {req.job_id} 已存在且登记参数不一致")
 
-            job_dir.mkdir(parents=True, exist_ok=True)
-            status = JobStatus(
-                job_id=req.job_id,
-                key_field=req.key_field,
-                page_size=req.page_size,
-                segments=seg_states,
-                published_pages=0,
-                total_published_rows=0,
-                finished=False,
-                next_page_no=1,
-                page_counts=[],
-            )
-            self._write_state(req.job_id, status)
-            return status
+                # 校验段文件：存在、可读、键为整数且全局非降序
+                seg_states: list[SegmentState] = []
+                for seg in req.segments:
+                    p = self._segment_path(seg.path)
+                    if not p.is_file():
+                        raise EngineError(f"段文件不存在: {seg.path}")
+                    self._validate_sorted_segment(p, req.key_field, seg.path)
+                    seg_states.append(SegmentState(path=seg.path, order=seg.order))
+
+                job_dir.mkdir(parents=True, exist_ok=True)
+                status = JobStatus(
+                    job_id=req.job_id,
+                    key_field=req.key_field,
+                    page_size=req.page_size,
+                    segments=seg_states,
+                    published_pages=0,
+                    total_published_rows=0,
+                    finished=False,
+                    next_page_no=1,
+                    page_counts=[],
+                )
+                self._write_state(req.job_id, status)
+                return status
 
     def _validate_sorted_segment(self, path: Path, key_field: str, rel: str) -> None:
         """流式校验：每行是 JSON 对象，键为整数，且键非降序。"""
@@ -270,22 +310,26 @@ class MergeService:
             if no not in valid_pages:
                 pf.unlink()
 
-        # 3) 段文件回收对账：
-        #    - reclaimed=True 但文件还在（unlink 丢失）-> 补删
-        #    - exhausted=True、reclaimed=False 且文件还在
-        #      （两阶段回收的阶段2/3 之间崩溃，文件尚未删或刚删完）-> 补删补标
+        # 3) 段文件回收对账（跨作业引用感知）：
+        #    段可能被多个作业登记，不能仅凭本作业 exhausted 就删。
+        #    按各作业已发布的进度重新做全局判定：所有引用方都耗尽
+        #    才允许 unlink，并把本作业对应段标记为 reclaimed；仍有
+        #    其他作业未耗尽则保留文件，本作业仅停在 exhausted 状态。
+        #    已发布页不在此过程中改动，保持原样。
         changed = False
-        for seg in status.segments:
-            if seg.exhausted and not seg.reclaimed:
-                p = self._segment_path(seg.path)
-                if p.exists():
-                    p.unlink()
-                seg.reclaimed = True
-                changed = True
-            elif seg.reclaimed:
-                p = self._segment_path(seg.path)
-                if p.exists():
-                    p.unlink()
+        with self._get_registry_lock():
+            for seg in status.segments:
+                if not seg.exhausted:
+                    continue
+                if not seg.reclaimed:
+                    # 两阶段回收阶段2/3 之间崩溃，或当时还有其他作业未耗尽
+                    if self._reclaim_if_unreferenced(seg.path):
+                        seg.reclaimed = True
+                        changed = True
+                elif self._segment_path(seg.path).exists():
+                    # 已标记回收但文件残留（unlink 落盘丢失/外部恢复）：
+                    # 仍做全局判定，确认没有未耗尽的引用方才补删
+                    self._reclaim_if_unreferenced(seg.path)
         if changed:
             self._write_state(job_id, status)
 
@@ -445,31 +489,85 @@ class MergeService:
         reader.seq += 1
         return entry
 
-    def _commit_and_reclaim(self, job_id: str, status: JobStatus) -> list[str]:
-        """两阶段回收，保证崩溃后可对账：
+    # ------------------------------------------------------------------ #
+    # 跨作业回收判定
+    # ------------------------------------------------------------------ #
+    def _iter_job_states(self) -> Iterable[JobStatus]:
+        """枚举工作目录下所有已登记作业的持久化状态。
 
-        阶段1  先原子提交状态（段已 exhausted、偏移已落盘，reclaimed=False）。
-               此后即使段文件被删，重启也知道它已消费完，不会再去读它。
-        阶段2  unlink 段文件；若在这一步后、阶段3 前崩溃，启动时由
-               ``_open_job`` 依据 reclaimed=False 但 exhausted=True 补做对账。
-        阶段3  再次提交状态（reclaimed=True）。正常情况下每次推进至多
-               一个段新耗尽，整作业只额外产生有限次数的状态写。
+        回收判定以磁盘上的 state.json 为准：登记事务在 state 落盘后
+        才对回收方可见，未登记完的作业不计入引用，也不会读到已删段。
         """
-        # 阶段1：提交耗尽/偏移
+        if not self.work_dir.exists():
+            return
+        for child in sorted(self.work_dir.iterdir()):
+            state_path = child / STATE_FILENAME
+            if not state_path.exists():
+                continue
+            # 状态损坏时直接报错：宁可不回收，也不能在引用关系不明时删段
+            yield self._read_state(child.name)
+
+    def _all_referrers_exhausted(self, seg_path: str) -> bool:
+        """所有登记了该段的作业是否都已把它耗尽（按已发布进度判断）。"""
+        for other in self._iter_job_states():
+            for other_seg in other.segments:
+                if other_seg.path == seg_path and not other_seg.exhausted:
+                    return False
+        return True
+
+    def _reclaim_if_unreferenced(self, seg_path: str) -> bool:
+        """跨作业回收判定，返回该段对当前作业而言是否已完成回收。
+
+        必须在登记表锁内调用：与作业登记互斥，扫描结果与 unlink
+        之间不会出现新的引用方。
+
+        - 仍有任一已登记作业未耗尽该段：保留文件，返回 False；
+        - 当前作业是最后一个耗尽它的作业：unlink 并返回 True
+          （即使当前作业还有别的段要归并）；
+        - 文件已不存在（如崩在 unlink 之后、标记提交之前）：
+          同样视为回收完成，返回 True。
+        """
+        if not self._all_referrers_exhausted(seg_path):
+            return False
+        p = self._segment_path(seg_path)
+        if p.exists():
+            p.unlink()
+            _fsync_dir(p.parent)
+        return True
+
+    def _commit_and_reclaim(self, job_id: str, status: JobStatus) -> list[str]:
+        """跨作业引用感知的两阶段回收，保证崩溃后可对账：
+
+        阶段1  先原子提交本作业状态（段已 exhausted、偏移已落盘，
+               reclaimed=False）。此后本作业不会再去读这些段；同时
+               该状态对回收扫描可见，本作业计入“已耗尽引用方”。
+        阶段2  在登记表锁内逐段做全局判定：只有所有登记该段的作业
+               都耗尽时才 unlink（最后一个耗尽者负责回收，哪怕它
+               还有别的段要跑）；仍有其他作业未耗尽则保留文件。
+               若在 unlink 后、阶段3 前崩溃，重启时 ``_open_job``
+               会按各作业已发布进度重新判定并补做回收。
+        阶段3  再次提交本作业状态（被实际回收的段 reclaimed=True）。
+        """
+        # 阶段1：提交本作业的耗尽/偏移
         self._write_state(job_id, status)
 
-        # 阶段2：回收段文件
+        # 竞态注入点：耗尽状态已提交、登记表锁尚未获取。此时阻塞
+        # 不会挡住其他作业登记；登记方先落盘后，下面的全局扫描
+        # 必然把它计入引用方。
+        if self._crash_hook is not None:
+            self._crash_hook("before_reclaim_scan")
+
+        # 阶段2：全局判定后回收段文件
         reclaimed: list[str] = []
-        for seg in status.segments:
-            if seg.exhausted and not seg.reclaimed:
-                p = self._segment_path(seg.path)
-                if p.exists():
-                    p.unlink()
-                reclaimed.append(seg.path)
+        with self._get_registry_lock():
+            for seg in status.segments:
+                if seg.exhausted and not seg.reclaimed:
+                    if self._reclaim_if_unreferenced(seg.path):
+                        reclaimed.append(seg.path)
         if self._crash_hook is not None and reclaimed:
             self._crash_hook("after_reclaim_unlink")
 
-        # 阶段3：提交回收标记
+        # 阶段3：提交本作业的回收标记
         for path in reclaimed:
             for seg in status.segments:
                 if seg.path == path:

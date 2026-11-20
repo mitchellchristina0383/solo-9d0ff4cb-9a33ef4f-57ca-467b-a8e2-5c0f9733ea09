@@ -115,3 +115,34 @@ def test_restart_resumes_within_same_mount_and_work(dirs):
         # 9 条记录，键序 1,2,3,5,5,5,7,8,9
         assert all_keys == [1, 2, 3, 5, 5, 5, 7, 8, 9]
         assert not list((mount / "segments").glob("*.jsonl"))
+
+
+def test_two_jobs_share_segment_via_api(client, dirs):
+    """两个作业登记同一份段：先完成的不删段，最后完成的回收。"""
+    mount, _ = dirs
+    body = _req_body(mount, page_size=4)
+    body_b = dict(body, job_id="api-demo-b")  # 同样三段，换个作业号
+
+    r = client.post("/jobs", json=body)
+    assert r.status_code == 201
+    assert client.post("/jobs", json=body_b).status_code == 201
+
+    # 作业 A 整批跑完：段被 B 共享，文件必须保留
+    run_a = client.post("/jobs/api-demo/run").json()
+    assert run_a["finished"] is True
+    assert len(list((mount / "segments").glob("*.jsonl"))) == 3
+
+    # 作业 B 仍可完整跑完，并由它回收共享段
+    run_b = client.post("/jobs/api-demo-b/run").json()
+    assert run_b["finished"] is True
+    assert not list((mount / "segments").glob("*.jsonl"))
+
+    # B 的输出与 A 完全一致（同输入同参数）
+    keys_a, keys_b = [], []
+    for jid, sink in (("api-demo", keys_a), ("api-demo-b", keys_b)):
+        pages = client.get(f"/jobs/{jid}/pages").json()
+        for meta in pages:
+            sink += [r["key"] for r in
+                     client.get(f"/jobs/{jid}/pages/{meta['page_no']}/json").json()["records"]]
+    assert keys_a == keys_b == [1, 2, 3, 5, 5, 5, 7, 8, 9]
+    assert all(s["reclaimed"] for s in client.get("/jobs/api-demo-b").json()["segments"])

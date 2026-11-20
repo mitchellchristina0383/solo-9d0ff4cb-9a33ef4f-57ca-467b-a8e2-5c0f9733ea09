@@ -47,10 +47,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="离线归并发布服务",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "k 路已排序 JSONL 段的末道归并：逐页发布、单页读取、"
-            "发布后回收段文件，支持进程中断后续跑，不漏不重。"
+            "发布后按跨作业引用计数回收段文件（同一段可被多个作业登记，"
+            "最后一个发完的作业才回收），支持进程中断后续跑，不漏不重。"
         ),
         lifespan=lifespan,
     )
@@ -95,7 +96,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/jobs/{job_id}/advance", response_model=AdvanceResult, tags=["jobs"])
     def advance_job(job_id: str) -> AdvanceResult:
-        """推进一轮：发布下一页（若有），并回收已全部发布的段文件。"""
+        """推进一轮：发布下一页；段在所有登记作业都发完后才回收。"""
         try:
             return service.advance(job_id)
         except EngineError as e:

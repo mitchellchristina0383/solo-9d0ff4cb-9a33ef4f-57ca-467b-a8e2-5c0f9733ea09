@@ -46,8 +46,12 @@ class SegmentState(BaseModel):
     path: str
     order: int
     offset: int = Field(0, description="下一条待处理记录在段文件中的字节偏移")
-    exhausted: bool = False
-    reclaimed: bool = False
+    exhausted: bool = Field(False, description="本作业是否已把该段全部记录随页发布")
+    reclaimed: bool = Field(
+        False,
+        description="段文件是否已被回收；同一段被多个作业登记时，"
+        "只有最后一个发完的作业执行 unlink 并将自己的该标记置 true",
+    )
 
 
 class JobStatus(BaseModel):
